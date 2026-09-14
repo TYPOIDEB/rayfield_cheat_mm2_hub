@@ -1,0 +1,375 @@
+local OWNER  = "TYPOIDEB"
+local REPO   = "rayfield_cheat_mm2"
+local BRANCH = "main"
+
+local VERSION_URL = "https://raw.githubusercontent.com/TYPOIDEB/rayfield_cheat_mm2/main/file.txt"
+
+local RAW_BASE = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(OWNER, REPO, BRANCH)
+local API_BASE = ("https://api.github.com/repos/%s/%s/contents"):format(OWNER, REPO)
+
+local HUB_FOLDER   = "MM2Hub"
+local HUB_DIR      = HUB_FOLDER .. "/"
+local VERSION_FILE = HUB_DIR .. "version.txt"
+
+local Stats = {
+    total = 0, downloaded = 0, fromDisk = 0,
+    failed = 0, bytesDown = 0, version = "?",
+}
+
+local function fsReady()
+    return type(isfile) == "function"
+       and type(readfile) == "function"
+       and type(writefile) == "function"
+end
+
+local function ensureFolder(path)
+    if type(isfolder) ~= "function" or type(makefolder) ~= "function" then return end
+    local ok, exists = pcall(isfolder, path)
+    if ok and not exists then pcall(makefolder, path) end
+end
+
+local function deleteFolderContents(path)
+    if type(listfiles) ~= "function" or type(delfile) ~= "function" or type(isfolder) ~= "function" then return end
+    local ok, exists = pcall(isfolder, path)
+    if not ok or not exists then return end
+    local lok, list = pcall(listfiles, path)
+    if not lok or type(list) ~= "table" then return end
+    for _, p in ipairs(list) do pcall(delfile, p) end
+end
+
+local function httpGet(url)
+    if type(game.HttpGet) == "function" then
+        local ok, res = pcall(game.HttpGet, game, url)
+        if ok and type(res) == "string" then return res end
+    end
+    if type(game.HttpGetAsync) == "function" then
+        local ok, res = pcall(game.HttpGetAsync, game, url)
+        if ok and type(res) == "string" then return res end
+    end
+    return nil
+end
+
+local function readRemoteVersion()
+    local data = httpGet(VERSION_URL .. "?t=" .. tostring(os.time()))
+    if not data then return nil end
+    for line in data:gmatch("[^\r\n]+") do
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if line ~= "" and not line:match("^#") then return line end
+    end
+    return nil
+end
+
+local function readLocalVersion()
+    if not fsReady() or not isfile(VERSION_FILE) then return nil end
+    local ok, data = pcall(readfile, VERSION_FILE)
+    if ok and type(data) == "string" then return data:gsub("%s+", "") end
+    return nil
+end
+
+local function writeLocalVersion(v)
+    if not fsReady() then return end
+    ensureFolder(HUB_FOLDER)
+    pcall(writefile, VERSION_FILE, v)
+end
+
+local function parseJsonList(response)
+    local items = {}
+    if type(response) ~= "string" then return items end
+    if response:match("^%s*{") and response:find('"message"', 1, true) then return items end
+    for chunk in response:gmatch("{.-}") do
+        local name = chunk:match('"name"%s*:%s*"([^"]+)"')
+        local typ  = chunk:match('"type"%s*:%s*"([^"]+)"')
+        if name and (typ == "file" or typ == "dir") then
+            table.insert(items, { name = name, type = typ })
+        end
+    end
+    return items
+end
+
+local function scanRepo()
+    local files = {}
+    local queue = { "" }
+    while #queue > 0 do
+        local folder = table.remove(queue, 1)
+        local url = (folder == "") and (API_BASE .. "?ref=" .. BRANCH)
+                                 or (API_BASE .. "/" .. folder .. "?ref=" .. BRANCH)
+        local response = httpGet(url)
+        if response then
+            for _, item in ipairs(parseJsonList(response)) do
+                local fullPath = (folder == "" and "" or (folder .. "/")) .. item.name
+                if item.type == "file" and item.name:match("%.lua$") then
+                    if not (folder == "" and item.name == "main.lua") then
+                        table.insert(files, fullPath)
+                    end
+                elseif item.type == "dir" then
+                    table.insert(queue, fullPath)
+                end
+            end
+        end
+    end
+    return files
+end
+
+local function downloadModule(path)
+    local safeName  = path:gsub("[/\\]", "_")
+    local localPath = HUB_DIR .. safeName
+    if fsReady() and isfile(localPath) then
+        local ok, data = pcall(readfile, localPath)
+        if ok and type(data) == "string" and #data > 0 then
+            Stats.fromDisk = Stats.fromDisk + 1
+            return data
+        end
+    end
+    local src = httpGet(RAW_BASE .. path)
+    if not src then Stats.failed = Stats.failed + 1; return nil end
+    if fsReady() then pcall(writefile, localPath, src) end
+    Stats.downloaded = Stats.downloaded + 1
+    Stats.bytesDown  = Stats.bytesDown + #src
+    return src
+end
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+local Window = Rayfield:CreateWindow({
+    Name = "MM2 Hub",
+    LoadingTitle = "Загрузка MM2 Hub...",
+    LoadingSubtitle = "by " .. OWNER,
+    ConfigurationSaving = { Enabled = true, FolderName = "MM2Hub", FileName = "Config" },
+    KeySystem = false
+})
+
+local Context = {
+    Rayfield         = Rayfield,
+    Window           = Window,
+    Players          = game:GetService("Players"),
+    RunService       = game:GetService("RunService"),
+    UserInputService = game:GetService("UserInputService"),
+    LocalPlayer      = game:GetService("Players").LocalPlayer,
+    Loaded           = {},
+    Toggles          = {},
+    ShutdownHandlers = {},
+    ShutdownResponses = {},
+    Alive            = true,
+    Exiting          = false,
+}
+
+function Context.RegisterToggle(t)
+    if t and t.Set then table.insert(Context.Toggles, t) end
+end
+
+function Context.RegisterShutdown(name, fn)
+    Context.ShutdownHandlers[name] = fn
+end
+
+function Context.MarkShutdownDone(name)
+    Context.ShutdownResponses[name] = true
+end
+
+function Context.DisableAll()
+    for _, t in ipairs(Context.Toggles) do
+        pcall(function() t:Set(false) end)
+    end
+    if Rayfield.Flags and type(Rayfield.Flags) == "table" then
+        for k, v in pairs(Rayfield.Flags) do
+            if type(v) == "boolean" then Rayfield.Flags[k] = false end
+        end
+    end
+end
+
+function Context.SweepNow()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        local ok, name = pcall(function() return obj.Name end)
+        if ok and type(name) == "string" and name:match("^MM2_") then
+            pcall(function() obj:Destroy() end)
+        end
+    end
+end
+
+function Context.ExitSequence()
+    if Context.Exiting then return end
+    Context.Exiting = true
+
+    -- Шаг 1: выключаем все тоглы
+    Context.DisableAll()
+
+    Rayfield:Notify({
+        Title = "MM2 Hub",
+        Content = "Отправляю команду exit модулям...",
+        Duration = 3
+    })
+
+    -- Шаг 2: собираем имена модулей
+    local names = {}
+    for name in pairs(Context.ShutdownHandlers) do
+        table.insert(names, name)
+    end
+
+    print(("[MM2 Hub] Отправляю команду exit модулям (всего: %d)"):format(#names))
+
+    if #names == 0 then
+        print("[MM2 Hub] Модулей нет — закрываюсь сразу")
+        Context.Alive = false
+        Context.SweepNow()
+        pcall(function() Rayfield:Destroy() end)
+        return
+    end
+
+    -- Шаг 3: сигнал exit — все модули начинают засыпать параллельно
+    Context.Alive = false
+
+    for _, name in ipairs(names) do
+        local fn = Context.ShutdownHandlers[name]
+        task.spawn(function()
+            local ok, err = pcall(fn, Context)
+            if not ok then
+                warn(("[MM2 Hub] Модуль '%s' упал при exit: %s"):format(name, tostring(err)))
+            end
+            Context.MarkShutdownDone(name)
+        end)
+    end
+
+    -- Шаг 4: ждём ответа с секундным отчётом в F9
+    local startTime = os.clock()
+    local lastReported = -1
+    local timeout = 15
+
+    while true do
+        task.wait(0.1)
+        local elapsed = math.floor(os.clock() - startTime)
+
+        if elapsed > lastReported then
+            lastReported = elapsed
+
+            local done = 0
+            for _, name in ipairs(names) do
+                if Context.ShutdownResponses[name] then
+                    done = done + 1
+                end
+            end
+
+            print(("[MM2 Hub] Отсчёт: %d сек | Ответили: %d/%d"):format(elapsed, done, #names))
+
+            if done >= #names then break end
+
+            if elapsed >= timeout then
+                local pending = {}
+                for _, name in ipairs(names) do
+                    if not Context.ShutdownResponses[name] then
+                        table.insert(pending, name)
+                    end
+                end
+                warn("[MM2 Hub] Таймаут! Не ответили: " .. table.concat(pending, ", "))
+                break
+            end
+        end
+    end
+
+    local total = os.clock() - startTime
+    print(("[MM2 Hub] Прошло %.2f секунд перед тем как ответили все модули"):format(total))
+
+    -- Шаг 5: финальная зачистка и закрытие
+    Context.SweepNow()
+    task.wait(0.2)
+    Context.SweepNow()
+
+    pcall(function() Rayfield:Destroy() end)
+end
+
+-- перехват ручного закрытия окна
+local originalDestroy = Rayfield.Destroy
+Rayfield.Destroy = function(self, ...)
+    if Context.Exiting then
+        return originalDestroy(self, ...)
+    end
+    task.spawn(function() Context.ExitSequence() end)
+end
+
+local function loadModule(path, src)
+    if type(src) ~= "string" then Stats.failed = Stats.failed + 1; return false end
+
+    local fn, err = loadstring(src, path)
+    if not fn then Stats.failed = Stats.failed + 1; return false end
+
+    local okRun, result = pcall(fn)
+    if not okRun then Stats.failed = Stats.failed + 1; return false end
+
+    if type(result) ~= "table" or type(result.Init) ~= "function" then
+        Stats.failed = Stats.failed + 1
+        return false
+    end
+
+    local fileName = path:match("([^/\\]+)$") or path
+    local tabName  = fileName:gsub("%.lua$", "")
+    local tabIcon  = result.Icon or 4483362458
+
+    local Tab = Window:CreateTab(tabName, tabIcon)
+
+    local okInit = pcall(result.Init, Context, Tab)
+    if not okInit then Stats.failed = Stats.failed + 1; return false end
+
+    Context.Loaded[path] = true
+    return true
+end
+
+local function formatBytes(b)
+    if b < 1024 then return b .. " B" end
+    if b < 1024 * 1024 then return string.format("%.1f KB", b / 1024) end
+    return string.format("%.2f MB", b / (1024 * 1024))
+end
+
+-- EXIT
+local ExitTab = Window:CreateTab("Exit", 4483362458)
+
+ExitTab:CreateSection("Выход")
+
+ExitTab:CreateButton({
+    Name = "Выключить всё и выйти",
+    Callback = function()
+        Context.ExitSequence()
+    end,
+})
+
+-- загрузка
+local remoteVersion = readRemoteVersion()
+if not remoteVersion then
+    Rayfield:Notify({ Title = "MM2 Hub", Content = "Не удалось прочитать file.txt", Duration = 8 })
+    return
+end
+
+Stats.version = remoteVersion
+local localVersion = readLocalVersion()
+
+if localVersion == nil then
+    ensureFolder(HUB_FOLDER)
+    writeLocalVersion(remoteVersion)
+elseif localVersion ~= remoteVersion then
+    deleteFolderContents(HUB_FOLDER)
+    ensureFolder(HUB_FOLDER)
+    writeLocalVersion(remoteVersion)
+end
+
+local files = scanRepo()
+Stats.total = #files
+
+if #files == 0 then
+    Rayfield:Notify({ Title = "MM2 Hub", Content = "Модулей не найдено", Duration = 6 })
+    return
+end
+
+table.sort(files)
+
+for _, path in ipairs(files) do
+    if not Context.Alive then break end
+    local src = downloadModule(path)
+    if src then loadModule(path, src) end
+end
+
+local summary = ("Найдено: %d | Скачано: %d | Из диска: %d | Ошибки: %d\nТрафик: %s"):format(
+    Stats.total, Stats.downloaded, Stats.fromDisk, Stats.failed, formatBytes(Stats.bytesDown)
+)
+
+Rayfield:Notify({
+    Title = ("MM2 Hub — %s"):format(remoteVersion),
+    Content = summary,
+    Duration = 8
+})
