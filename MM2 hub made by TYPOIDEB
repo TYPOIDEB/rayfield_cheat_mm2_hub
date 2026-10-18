@@ -5,16 +5,16 @@ local BRANCH = "main"
 local RAW_BASE     = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(OWNER, REPO, BRANCH)
 local API_BASE     = ("https://api.github.com/repos/%s/%s/contents"):format(OWNER, REPO)
 local VERSION_URL  = RAW_BASE .. "file.txt"
-local MANIFEST_URL = RAW_BASE .. "manifest.txt"
 
 local HUB_FOLDER   = "MM2Hub"
 local HUB_DIR      = HUB_FOLDER .. "/"
 local VERSION_FILE = HUB_DIR .. "version.txt"
+local SNAPSHOT_FILE = HUB_DIR .. "snapshot.txt"
 
 local Stats = {
     total = 0, downloaded = 0, fromDisk = 0,
     failed = 0, bytesDown = 0, version = "?",
-    manifestUsed = false,
+    removed = 0,
 }
 
 local function fsReady()
@@ -73,30 +73,38 @@ local function writeLocalVersion(v)
     pcall(writefile, VERSION_FILE, v)
 end
 
-local function parseManifest(data)
-    local mods = {}
-    if type(data) ~= "string" then return mods end
-    for line in data:gmatch("[^\r\n]+") do
-        line = line:gsub("^%s+", ""):gsub("%s+$", "")
-        if line ~= "" and not line:match("^#") then
-            local path, ver = line:match("^([^|]+)|(.+)$")
-            if not path then path, ver = line:match("^([^%s]+)%s+(.+)$") end
-            if path then
-                path = path:gsub("%s+$", "")
-                ver  = (ver or "no-version"):gsub("%s+$", "")
-                table.insert(mods, { path = path, ver = ver })
-            end
-        end
-    end
-    return mods
+local function fingerprint(src)
+    if type(src) ~= "string" or #src == 0 then return "0" end
+    local head = src:sub(1, 64):gsub("%s", "")
+    local tail = src:sub(-64):gsub("%s", "")
+    return tostring(#src) .. ":" .. head .. ":" .. tail
 end
 
-local function readRemoteManifest()
-    local data = httpGet(MANIFEST_URL .. "?t=" .. tostring(os.time()))
-    if not data then return nil end
-    local mods = parseManifest(data)
-    if #mods == 0 then return nil end
-    return mods
+local function parseSnapshot(data)
+    local map = {}
+    if type(data) ~= "string" then return map end
+    for line in data:gmatch("[^\r\n]+") do
+        local path, fp = line:match("^([^|]+)|(.+)$")
+        if path then map[path] = fp end
+    end
+    return map
+end
+
+local function readSnapshot()
+    if not fsReady() or not isfile(SNAPSHOT_FILE) then return {} end
+    local ok, data = pcall(readfile, SNAPSHOT_FILE)
+    if ok and type(data) == "string" then return parseSnapshot(data) end
+    return {}
+end
+
+local function writeSnapshot(map)
+    if not fsReady() then return end
+    local lines = {}
+    for path, fp in pairs(map) do
+        table.insert(lines, path .. "|" .. fp)
+    end
+    ensureFolder(HUB_FOLDER)
+    pcall(writefile, SNAPSHOT_FILE, table.concat(lines, "\n"))
 end
 
 local function parseJsonList(response)
@@ -137,17 +145,9 @@ local function scanRepo()
     return files
 end
 
-local function ensureModule(mod)
-    local safeName  = mod.path:gsub("[/\\]", "_")
+local function ensureModule(path, snapshot)
+    local safeName  = path:gsub("[/\\]", "_")
     local localPath = HUB_DIR .. safeName
-    local verPath   = HUB_DIR .. safeName .. ".ver"
-
-    local function readLocalVer()
-        if not fsReady() or not isfile(verPath) then return nil end
-        local ok, v = pcall(readfile, verPath)
-        if ok and type(v) == "string" then return v:gsub("%s+", "") end
-        return nil
-    end
 
     local function readLocalFile()
         if not fsReady() or not isfile(localPath) then return nil end
@@ -156,51 +156,35 @@ local function ensureModule(mod)
         return nil
     end
 
-    local localVer  = readLocalVer()
     local localData = readLocalFile()
+    local remoteSrc = httpGet(RAW_BASE .. path .. "?t=" .. tostring(os.time()))
 
-    if not mod.ver or mod.ver == "no-version" then
-        local src = httpGet(RAW_BASE .. mod.path .. "?t=" .. tostring(os.time()))
-        if not src or #src == 0 then
-            if localData then Stats.fromDisk = Stats.fromDisk + 1; return localData end
-            Stats.failed = Stats.failed + 1
-            return nil
-        end
-        if localData == src then
+    if not remoteSrc or #remoteSrc == 0 then
+        if localData then
             Stats.fromDisk = Stats.fromDisk + 1
             return localData
         end
-        if fsReady() then
-            ensureFolder(HUB_FOLDER)
-            pcall(writefile, localPath, src)
-        end
-        Stats.downloaded = Stats.downloaded + 1
-        Stats.bytesDown = Stats.bytesDown + #src
-        return src
-    end
-
-    if localVer == mod.ver and localData then
-        Stats.fromDisk = Stats.fromDisk + 1
-        return localData
-    end
-
-    local src = httpGet(RAW_BASE .. mod.path .. "?v=" .. tostring(mod.ver))
-    if not src or #src == 0 then
-        if localData then Stats.fromDisk = Stats.fromDisk + 1; return localData end
         Stats.failed = Stats.failed + 1
         return nil
     end
 
+    local remoteFp = fingerprint(remoteSrc)
+    local localFp  = localData and fingerprint(localData) or nil
+    local snapFp   = snapshot[path]
+
+    if localData and localFp == remoteFp and snapFp == remoteFp then
+        Stats.fromDisk = Stats.fromDisk + 1
+        return localData
+    end
+
     if fsReady() then
         ensureFolder(HUB_FOLDER)
-        local wok = pcall(writefile, localPath, src)
-        if wok then
-            pcall(writefile, verPath, mod.ver)
-        end
+        pcall(writefile, localPath, remoteSrc)
     end
+    snapshot[path] = remoteFp
     Stats.downloaded = Stats.downloaded + 1
-    Stats.bytesDown = Stats.bytesDown + #src
-    return src
+    Stats.bytesDown = Stats.bytesDown + #remoteSrc
+    return remoteSrc
 end
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
@@ -421,38 +405,43 @@ elseif localVersion ~= remoteVersion then
     writeLocalVersion(remoteVersion)
 end
 
-local modules
-local manifest = readRemoteManifest()
-if manifest then
-    modules = manifest
-    Stats.manifestUsed = true
-    print(("[MM2 Hub] Использую manifest.txt (%d модулей)"):format(#modules))
-else
-    print("[MM2 Hub] manifest.txt не найден — fallback (сравнение содержимого).")
-    local files = scanRepo()
-    modules = {}
-    for _, path in ipairs(files) do
-        table.insert(modules, { path = path, ver = nil })
-    end
-end
+local snapshot = readSnapshot()
 
-Stats.total = #modules
-if #modules == 0 then
+local files = scanRepo()
+Stats.total = #files
+
+if #files == 0 then
     Rayfield:Notify({ Title = "MM2 Hub", Content = "Модулей не найдено", Duration = 6 })
     return
 end
 
-table.sort(modules, function(a, b) return a.path < b.path end)
+local remoteSet = {}
+for _, path in ipairs(files) do remoteSet[path] = true end
 
-for _, mod in ipairs(modules) do
-    if not Context.Alive then break end
-    local src = ensureModule(mod)
-    if src then loadModule(mod.path, src) end
+for path in pairs(snapshot) do
+    if not remoteSet[path] then
+        local safeName = path:gsub("[/\\]", "_")
+        local localPath = HUB_DIR .. safeName
+        if fsReady() and isfile(localPath) then
+            pcall(delfile, localPath)
+            Stats.removed = Stats.removed + 1
+        end
+        snapshot[path] = nil
+    end
 end
 
-local summary = ("Найдено: %d | Скачано: %d | Из диска: %d | Ошибки: %d\nТрафик: %s%s"):format(
-    Stats.total, Stats.downloaded, Stats.fromDisk, Stats.failed, formatBytes(Stats.bytesDown),
-    Stats.manifestUsed and "\nСверка: по manifest.txt" or "\nСверка: fallback (сравнение содержимого)"
+table.sort(files)
+
+for _, path in ipairs(files) do
+    if not Context.Alive then break end
+    local src = ensureModule(path, snapshot)
+    if src then loadModule(path, src) end
+end
+
+writeSnapshot(snapshot)
+
+local summary = ("Найдено: %d | Скачано: %d | Из диска: %d | Ошибки: %d | Удалено: %d\nТрафик: %s"):format(
+    Stats.total, Stats.downloaded, Stats.fromDisk, Stats.failed, Stats.removed, formatBytes(Stats.bytesDown)
 )
 
 Rayfield:Notify({
